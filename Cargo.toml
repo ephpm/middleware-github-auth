@@ -1,0 +1,110 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# 1.88 matches the ePHPm workspace and the `ephpm-middleware` ABI crate these
+# modules depend on by git rev; cargo refuses to compile a dependency whose
+# declared rust-version exceeds the active toolchain.
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/ephpm/middleware-github-auth"
+
+[workspace.dependencies]
+# The ePHPm native-middleware ABI + authoring kit. It lives in the ePHPm repo
+# (`crates/ephpm-middleware`) and is the shared contract between the host and
+# every module. It is pinned by `rev` exactly the way ePHPm pins litewire: a
+# drift in `EphpmHostV1` / `ABI_V1` would be silent UB at the FFI boundary, so
+# both modules here are provably built against one specific host-ABI commit. To
+# rebuild against a newer host, replace `rev` and run `cargo update`.
+#
+# Pinned at ePHPm main `b380cc6d0bbc61110475c0c3db3097e8bdf25018`, which is
+# past #408 — the PR that made the request phase run on the STATIC-file path
+# too (fail-closed), so an auth gate protects static assets and not only
+# PHP-dispatched requests (issue #395). Both modules here rely on that: a
+# request with no valid session is short-circuited before the file is read.
+#
+# This rev deliberately does NOT depend on the request-scheme / host accessors
+# proposed in #409 (not merged here): the ABI at this rev exposes no request
+# scheme, so `session-cookie` does not do a server-side transport check — see
+# its module docs.
+ephpm-middleware = { git = "https://github.com/ephpm/ephpm.git", rev = "b380cc6d0bbc61110475c0c3db3097e8bdf25018" }
+# Test-only: the same embedded KV store the host wires into the middleware host
+# table, so the `host` feature's `RequestCtx` / `host_table` can fabricate a
+# request in unit and integration tests. Same rev as the ABI crate so both
+# resolve to one crate instance and the `Store` type matches.
+ephpm-kv = { git = "https://github.com/ephpm/ephpm.git", rev = "b380cc6d0bbc61110475c0c3db3097e8bdf25018" }
+
+# Both modules parse their config out of a `serde_json::Value`.
+serde_json = "1"
+# HS256 session-token minting and verification. Same primitives — and the same
+# constant-time `Mac::verify_slice` — on both sides, so a token minted by
+# `github-auth` and verified by `session-cookie` agree by construction.
+base64ct = { version = "1", features = ["alloc"] }
+hmac = "0.12"
+sha2 = "0.10"
+# OS entropy for the OAuth `state` nonce (github-auth). A syscall shim.
+getrandom = "0.3"
+
+# ── github-auth only: outbound HTTPS to GitHub ─────────────────────────────
+#
+# `rustls-tls-manual-roots-no-provider` is the correct reqwest TLS feature:
+# every other `rustls-tls-*` feature also enables reqwest's `__rustls-ring` and
+# links `ring` as a second crypto provider. "manual roots" + "no provider"
+# means reqwest supplies neither a provider nor a root store; `github.rs` hands
+# it a fully-built `rustls::ClientConfig` (aws-lc-rs provider, OS + bundled
+# roots) instead. This is the same feature set the ePHPm workspace pins.
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "rustls-tls-manual-roots-no-provider",
+] }
+# One crypto provider, aws-lc-rs, named explicitly in `github.rs`
+# (`builder_with_provider`) — matching ePHPm's convergence on a single provider.
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "tls12",
+    "logging",
+    "aws-lc-rs",
+] }
+rustls-native-certs = "0.8"
+webpki-roots = "0.26"
+
+# Release-profile tuning. `panic = "abort"` is DELIBERATELY NOT set: the
+# `declare!` glue in `ephpm-middleware` uses `catch_unwind` to fail CLOSED on a
+# panicking `invoke` (return 500) and fail STARTUP on a panicking `init`. Under
+# `panic = "abort"` those become no-ops and any module panic kills the whole
+# host process. Keep unwinding.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Mirror the ePHPm workspace's allow-list so a module that passes clippy here
+# passes it there too.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+doc_markdown = "allow"
+items_after_statements = "allow"
+manual_clamp = "allow"
+manual_let_else = "allow"
+needless_pass_by_value = "allow"
+ref_option = "allow"
+single_match_else = "allow"
+struct_excessive_bools = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+unchecked_time_subtraction = "allow"
+ignore_without_reason = "allow"
+uninlined_format_args = "allow"
+unnecessary_cast = "allow"
+unused_async = "allow"
+unused_self = "allow"
+used_underscore_binding = "allow"

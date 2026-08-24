@@ -1,0 +1,55 @@
+[package]
+name = "ephpm-middleware-github-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "ePHPm native middleware: GitHub OAuth login gate (cold path) that issues a stateless signed session for private preview sites"
+
+[lib]
+# Artifact name: libgithub_auth.so / libgithub_auth.dylib / github_auth.dll.
+# That file is what `[[middleware]] library = "..."` points at.
+name = "github_auth"
+# cdylib is the loadable module. The rlib exists only so the unit and
+# integration tests can link the same code; a shipped module needs cdylib
+# alone.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ephpm-middleware.workspace = true
+serde_json.workspace = true
+# Session/state token signing. Same primitives (and the same constant-time
+# `Mac::verify_slice`) as the `session-cookie` verifier in this workspace, so a
+# token minted here and a token verified there agree by construction.
+base64ct.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+# OS entropy for the OAuth `state` nonce. A syscall shim, not a generator.
+getrandom.workspace = true
+
+# NOTE: `tracing` is deliberately NOT a dependency. A dlopen'd module links
+# its own copy of the `tracing` crate with its own global dispatcher, which is
+# never the host's — a `tracing::info!` here would be silently swallowed. The
+# ABI's `log` callback (`ephpm_middleware::Host::log`) is the only thing that
+# reaches ePHPm's log stream, and it is what this module uses.
+
+# ── Outbound HTTPS to GitHub ──────────────────────────────────────────────
+#
+# This is the reason the module ships as a dlopen'd cdylib rather than a
+# builtin: an HTTP client and a TLS stack are real weight, and none of it
+# belongs in the ephpm binary. See the workspace `Cargo.toml` for why exactly
+# these reqwest/rustls features (one crypto provider, no `ring`).
+reqwest.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+# `host` supplies the request context and callback table so tests can build a
+# real `Request` without a running server. A shipped module never enables it.
+ephpm-middleware = { workspace = true, features = ["host"] }
+
+[lints]
+workspace = true

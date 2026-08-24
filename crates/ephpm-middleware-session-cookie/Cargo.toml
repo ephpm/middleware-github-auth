@@ -1,0 +1,35 @@
+[package]
+name = "ephpm-middleware-session-cookie"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "ePHPm native middleware: signed session-cookie verification with redirect-to-login (the hot-path verifier for the GitHub OAuth gate)"
+
+[lib]
+# Artifact name: libsession_cookie.so / .dylib / session_cookie.dll.
+# That file is what `[[middleware]] library = "..."` points at.
+name = "session_cookie"
+# cdylib is the loadable module. The rlib exists only so the unit tests can
+# link the same code; a shipped module needs cdylib alone.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ephpm-middleware.workspace = true
+serde_json.workspace = true
+# HS256 verification. Same primitives (and the same constant-time
+# `Mac::verify_slice`) as the `github-auth` issuer, so a token minted there and
+# verified here agree by construction.
+base64ct.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+# `host` supplies the request context and callback table so tests can build a
+# real `Request` without a running server. A shipped module never enables it.
+ephpm-middleware = { workspace = true, features = ["host"] }
+
+[lints]
+workspace = true
