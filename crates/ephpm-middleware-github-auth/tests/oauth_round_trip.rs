@@ -32,7 +32,14 @@ use ephpm_middleware::host::{RequestCtx, host_table};
 use ephpm_middleware::{Middleware as _, Request, Response};
 use github_auth::{GithubAuth, query_param};
 
-const VHOST: &str = "pr-1.preview.test";
+/// The request host the browser asks for — a routable authority, and what the
+/// derived `redirect_uri` is built from.
+const HOST: &str = "pr-1.preview.test";
+/// The canonical site key the router resolves that host to, under a
+/// `sites_domain_suffix` of `.preview.test`. Since middleware ABI minor 3 this
+/// — not [`HOST`] — is what `request_vhost_id` returns and what lands in the
+/// session's `site` claim (ephpm#390).
+const SITE: &str = "pr-1";
 const SESSION_SECRET: &str = "0123456789abcdef0123456789abcdef";
 const CLIENT_SECRET: &str = "stub-client-secret";
 const GOOD_CODE: &str = "goodcode";
@@ -186,9 +193,9 @@ fn gate(stub: &Stub, extra: serde_json::Value) -> GithubAuth {
         "repo": "acme/web",
         "github_base": stub.base,
         "github_api_base": stub.base,
-        // The derived redirect_uri would be https://<vhost>/…; pin it so the
-        // exchange body is deterministic.
-        "redirect_uri": format!("https://{VHOST}/_ephpm/auth/github/callback"),
+        // The derived redirect_uri would be https://<request host>/…; pin it so
+        // the exchange body is deterministic.
+        "redirect_uri": format!("https://{HOST}/_ephpm/auth/github/callback"),
     });
     for (k, v) in extra.as_object().cloned().unwrap_or_default() {
         cfg[k] = v;
@@ -197,7 +204,9 @@ fn gate(stub: &Stub, extra: serde_json::Value) -> GithubAuth {
 }
 
 fn call(mw: &GithubAuth, path: &str, query: &str, headers: &[(String, String)]) -> Response {
-    let ctx = RequestCtx::new("GET", path, query, "203.0.113.9", VHOST, headers);
+    // Fifth argument = the canonical SITE key (ABI minor 3); `with_host` is
+    // the request host the client sent. Two values, two jobs.
+    let ctx = RequestCtx::new("GET", path, query, "203.0.113.9", SITE, headers).with_host(HOST);
     // SAFETY: `ctx` outlives the borrow and `host_table()` is 'static — the
     // exact contract `Request::from_raw` documents.
     let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
@@ -316,7 +325,9 @@ fn happy_path_exchanges_the_code_checks_access_and_issues_a_session() {
             .expect("payload is JSON");
     assert_eq!(json["sub"], "octocat");
     assert_eq!(json["gh_id"], 583_231);
-    assert_eq!(json["site"], VHOST);
+    // The `site` claim is the canonical site key, NOT the request host: with a
+    // `sites_domain_suffix` those differ, and the tenant is the former.
+    assert_eq!(json["site"], SITE);
     assert_eq!(json["via"], "github");
     assert_eq!(json["check"], "repo acme/web");
 }

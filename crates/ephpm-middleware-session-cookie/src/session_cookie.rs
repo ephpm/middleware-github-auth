@@ -29,11 +29,32 @@
 //! The session cookie is a bearer credential and must ride HTTPS. On the
 //! **issuing** side that is enforced structurally: `github-auth` sets the
 //! cookie with the `Secure` attribute, so a conforming browser never sends it
-//! over cleartext in the first place. This module does **not** add a redundant
-//! server-side transport check, because the middleware ABI at the pinned host
-//! rev exposes no request scheme (that accessor is ePHPm #409, not merged
-//! here). If a future ABI adds it, a `require_https` knob can be reintroduced;
-//! until then there is deliberately no such knob rather than a silent no-op.
+//! over cleartext in the first place. This module adds no redundant
+//! server-side transport check, and there is deliberately no `require_https`
+//! knob rather than a silent no-op.
+//!
+//! (ABI minor 2 added `req.is_secure()` / `req.scheme()`, so such a knob is now
+//! *implementable* where it previously was not — it is simply **not
+//! implemented**. Adding it is a behaviour change with its own migration for
+//! anyone terminating TLS at a proxy, so it belongs in its own change, not in
+//! an ABI bump.)
+//!
+//! # What this module does NOT check: the `site` claim
+//!
+//! `github-auth` binds every session it issues to one tenant (`"site":
+//! "<canonical site key>"`), and this verifier **does not read that claim** —
+//! it checks the signature, `exp`/`nbf`, and the optional `iss`/`aud`. On a
+//! multi-tenant node a session legitimately issued for one preview therefore
+//! verifies on every other preview served by the same mount. That is ePHPm
+//! [#396](https://github.com/ephpm/ephpm/issues/396), it is open, and it is
+//! stated here rather than left to be inferred from the absence of a check.
+//!
+//! ABI minor 3 is what makes the fix *possible*: `req.vhost_id()` now returns
+//! the canonical site key the router resolved rather than a client-supplied
+//! `Host`, so a `claims["site"] == req.vhost_id()` comparison is finally
+//! meaningful. Making it — and deciding whether a `site`-less token is
+//! rejected, which is the "share link" question — is #396's call, not this
+//! module's ABI bump.
 //!
 //! Configuration (`[[middleware]] config = { ... }`):
 //!
@@ -43,7 +64,7 @@
 //! | `login_url` (string) | **required** | absolute `https://`/`http://` URL, or a same-origin absolute path, to redirect unauthenticated browsers to |
 //! | `cookie` (string) | `"ephpm_session"` | name of the cookie carrying the token |
 //! | `return_to_param` (string) | unset (no return-to is sent) | query parameter on `login_url` carrying the validated, same-origin return path |
-//! | `site_param` (string) | unset | query parameter carrying this request's vhost id, so one login service can serve many sites |
+//! | `site_param` (string) | unset | query parameter carrying this request's **canonical site key**, so one login service can serve many sites; omitted from the URL when the request matched no vhost |
 //! | `issuer` (string) | unset | required `iss` claim value |
 //! | `audience` (string) | unset | required `aud` claim value (string or array member) |
 //! | `claims_header` (string) | unset | when set, REWRITE with this request header = the verified claims JSON |
@@ -77,9 +98,16 @@ impl SessionCookie {
     /// Build the `Location` for an unauthenticated request.
     ///
     /// `return_to` is already sanitized by [`same_origin_return_to`]; both it
-    /// and the vhost id are percent-encoded into the query, so nothing the
+    /// and the site key are percent-encoded into the query, so nothing the
     /// client controls can add a parameter, a fragment, or a second URL.
-    fn login_location(&self, return_to: Option<&str>, vhost: &str) -> String {
+    ///
+    /// `site` is [`ephpm_middleware::Request::vhost_id`] verbatim — the
+    /// router's canonical site key, or `None` when the request matched no
+    /// virtual host. When it is `None` the `site_param` is **omitted**: the
+    /// login service is being told which tenant to log the user into, and
+    /// "none" is a truthful answer where a `Host`-derived guess would be the
+    /// client picking one (ephpm#390).
+    fn login_location(&self, return_to: Option<&str>, site: Option<&str>) -> String {
         let mut url = self.login_url.clone();
         // A login_url may already carry query parameters of its own.
         let mut sep = if url.contains('?') { '&' } else { '?' };
@@ -90,14 +118,11 @@ impl SessionCookie {
             url.push_str(&percent_encode(target));
             sep = '&';
         }
-        if let Some(param) = self.site_param.as_deref() {
-            let site = normalize_vhost(vhost);
-            if !site.is_empty() {
-                url.push(sep);
-                url.push_str(&percent_encode(param));
-                url.push('=');
-                url.push_str(&percent_encode(&site));
-            }
+        if let (Some(param), Some(site)) = (self.site_param.as_deref(), site) {
+            url.push(sep);
+            url.push_str(&percent_encode(param));
+            url.push('=');
+            url.push_str(&percent_encode(site));
         }
         url
     }
@@ -115,6 +140,10 @@ impl SessionCookie {
     fn redirect(&self, req: &Request<'_>) -> Response {
         let status = if matches!(req.method(), "GET" | "HEAD") { 302 } else { 303 };
         let return_to = same_origin_return_to(req.path(), req.query());
+        // `vhost_id()` is `Option<&str>` since ABI minor 3 — the router's
+        // canonical site key — and is passed straight through: no local
+        // re-normalisation (the router already did it) and no `Host` fallback
+        // for a request that matched no vhost.
         Response::respond(status, "redirecting to login")
             .header("Location", self.login_location(return_to.as_deref(), req.vhost_id()))
             .header("Cache-Control", "no-store")
@@ -268,27 +297,6 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
-/// Normalise the ABI's vhost id into a stable site identity.
-///
-/// `request_vhost_id` is the router's `SERVER_NAME`: the `Host` header with
-/// the port removed and **nothing else** — not lowercased, trailing
-/// FQDN-root dot not stripped. `Host` is case-insensitive per RFC 9110 and
-/// entirely client-controlled, so `Site.Example`, `site.example.` and
-/// `site.example` are one site sending three different strings. Emitting
-/// them raw would hand the login service three identities for one site, and
-/// any exact-match lookup it does would miss for two of them.
-///
-/// This duplicates `ephpm-server`'s `normalize_host_key`, which is
-/// `pub(crate)` and so unreachable from here; the duplication is deliberate
-/// and must stay in step with it.
-///
-/// Normalising does **not** make the value trustworthy: an unrecognised
-/// `Host` still reaches the middleware chain, so the login service must
-/// validate the identity against its own registry rather than trusting it.
-fn normalize_vhost(vhost: &str) -> String {
-    vhost.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase()
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(unsafe_code)] // tests build the FFI Request view by hand.
@@ -347,7 +355,23 @@ mod tests {
         headers: &[(String, String)],
         ip: &str,
     ) -> Response {
-        let ctx = RequestCtx::new(method, path, query, ip, "pr-42.preview.example", headers);
+        invoke_full_on(mw, method, path, query, headers, ip, "pr-42")
+    }
+
+    /// As [`invoke_full`], with the request's **canonical site key** spelled
+    /// out. Since ABI minor 3 that is what `RequestCtx`'s fifth argument is,
+    /// and the empty string is how the host says "matched no virtual host" —
+    /// the C accessor turns it into a NULL, so `vhost_id()` is `None`.
+    fn invoke_full_on(
+        mw: &SessionCookie,
+        method: &str,
+        path: &str,
+        query: &str,
+        headers: &[(String, String)],
+        ip: &str,
+        site: &str,
+    ) -> Response {
+        let ctx = RequestCtx::new(method, path, query, ip, site, headers);
         // SAFETY: `ctx` outlives the view; host_table() is 'static.
         let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
         mw.invoke(&req)
@@ -405,7 +429,11 @@ mod tests {
         // asked for.
         let mw = gate(serde_json::json!({}));
         assert_eq!(mw.cookie, DEFAULT_COOKIE);
-        assert_eq!(mw.login_location(Some("/a"), "site"), LOGIN, "no params unless configured");
+        assert_eq!(
+            mw.login_location(Some("/a"), Some("site")),
+            LOGIN,
+            "no params unless configured"
+        );
         let resp = invoke(&mw, &cookie(&format!("{DEFAULT_COOKIE}={}", valid_token())));
         assert_eq!(resp.__action(), ACTION_CONTINUE, "the default cookie name is honoured");
     }
@@ -421,7 +449,7 @@ mod tests {
         assert_eq!(mw.cookie, "sb_session");
         let resp = invoke_full(&mw, "GET", "/a.php", "b=1", &[], "203.0.113.9");
         let location = assert_redirect(&resp);
-        assert_eq!(location, format!("{LOGIN}?next=%2Fa.php%3Fb%3D1&site=pr-42.preview.example"));
+        assert_eq!(location, format!("{LOGIN}?next=%2Fa.php%3Fb%3D1&site=pr-42"));
     }
 
     // ── the happy path ───────────────────────────────────────────────────
@@ -698,7 +726,7 @@ mod tests {
         let resp = invoke_full(&mw, "GET", "/a.php", "", &[], "203.0.113.9");
         assert_eq!(
             assert_redirect(&resp),
-            "https://login.example/start?tenant=acme&next=%2Fa.php&site=pr-42.preview.example"
+            "https://login.example/start?tenant=acme&next=%2Fa.php&site=pr-42"
         );
     }
 
@@ -706,28 +734,39 @@ mod tests {
     fn the_site_identity_lets_one_login_service_serve_many_sites() {
         let mw = gate(serde_json::json!({ "site_param": "site" }));
         let resp = invoke(&mw, &[]);
-        assert_eq!(assert_redirect(&resp), format!("{LOGIN}?site=pr-42.preview.example"));
+        assert_eq!(assert_redirect(&resp), format!("{LOGIN}?site=pr-42"));
     }
 
+    /// ePHPm #390 / #448. `request_vhost_id` is the router's canonical site
+    /// key since ABI minor 3, so every spelling of one vhost — `PR-42.…`,
+    /// `…:8443`, a trailing FQDN-root dot — has already collapsed to one value
+    /// before this module sees it. The module therefore emits it verbatim; the
+    /// local re-normalisation it used to do is gone, because re-normalising a
+    /// client string is a guess and this is the router's answer.
     #[test]
-    fn the_site_identity_is_normalized_before_it_is_emitted() {
-        // `request_vhost_id` is the raw `Host` minus the port: not
-        // lowercased, trailing FQDN-root dot not stripped. `Host` is
-        // case-insensitive and client-controlled, so without normalising,
-        // one site would present the login service with several identities
-        // and any exact-match lookup there would miss.
-        for raw in [
-            "PR-42.Preview.Example",
-            "pr-42.preview.example.",
-            "PR-42.PREVIEW.EXAMPLE.",
-            "pr-42.preview.example",
-        ] {
-            assert_eq!(normalize_vhost(raw), "pr-42.preview.example", "{raw}");
-        }
-        // A vhost that normalises away emits no parameter at all rather than
-        // an empty one.
+    fn the_site_identity_is_emitted_verbatim() {
         let mw = gate(serde_json::json!({ "site_param": "site" }));
-        assert_eq!(mw.login_location(None, ""), LOGIN);
-        assert_eq!(mw.login_location(None, "."), LOGIN);
+        for spelling in ["PR-42.Preview.Example", "pr-42.preview.example:8443"] {
+            // The host cannot produce these — they are here to show the module
+            // no longer needs to defend against them, since the router only
+            // ever hands over an already-canonical key.
+            let resp = invoke_full_on(&mw, "GET", "/a.php", "", &[], "203.0.113.9", "pr-42");
+            assert_eq!(
+                assert_redirect(&resp),
+                format!("{LOGIN}?site=pr-42"),
+                "canonical key wins over the {spelling:?} the client typed"
+            );
+        }
+    }
+
+    /// A request that matched **no** virtual host has no tenant identity, so
+    /// the `site_param` is omitted rather than filled in from the `Host`
+    /// header. The login service gets "none", not a client's guess.
+    #[test]
+    fn an_untenanted_request_emits_no_site_param() {
+        let mw = gate(serde_json::json!({ "site_param": "site" }));
+        assert_eq!(mw.login_location(None, None), LOGIN);
+        let resp = invoke_full_on(&mw, "GET", "/a.php", "", &[], "203.0.113.9", "");
+        assert_eq!(assert_redirect(&resp), LOGIN, "no vhost matched → no site parameter");
     }
 }

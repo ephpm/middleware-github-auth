@@ -114,7 +114,9 @@ pub struct Config {
 
     /// Access check applied when the request's vhost has no `sites` entry.
     pub default_check: Option<Check>,
-    /// Per-vhost access checks (`request_vhost_id` → check).
+    /// Per-vhost access checks, keyed by the **canonical site key**
+    /// (`request_vhost_id` since ABI minor 3 — the vhost directory name, not
+    /// the `Host` header). See [`Config::check_for`].
     pub sites: BTreeMap<String, Check>,
 
     /// Reserved path that starts a login.
@@ -365,18 +367,22 @@ impl Config {
             crate::token::STATE_KEY_LABEL,
         ));
 
-        // Access targets. `sites` maps a vhost id to its own check, which is
-        // what lets one mount serve a fleet of per-PR preview hostnames.
+        // Access targets. `sites` maps a CANONICAL SITE KEY to its own check,
+        // which is what lets one mount serve a fleet of per-PR previews. Since
+        // ABI minor 3 the key is the vhost directory name the router matched,
+        // NOT the request hostname — with a `sites_domain_suffix` of
+        // `.preview.example.com`, `pr-1.preview.example.com` resolves to the
+        // site key `pr-1`, and `pr-1` is what belongs here.
         let mut sites = BTreeMap::new();
         match config.get("sites") {
             None | Some(serde_json::Value::Null) => {}
             Some(serde_json::Value::Object(map)) => {
-                for (host, entry) in map {
-                    let host_key = normalize_vhost(host);
-                    validate_vhost(&host_key)?;
-                    let check = parse_check(entry, &format!("sites.{host}"))?
-                        .ok_or_else(|| format!("sites.{host}: no repo/org/team configured"))?;
-                    sites.insert(host_key, check);
+                for (site, entry) in map {
+                    let site_key = normalize_site_key(site);
+                    validate_site_key(&site_key)?;
+                    let check = parse_check(entry, &format!("sites.{site}"))?
+                        .ok_or_else(|| format!("sites.{site}: no repo/org/team configured"))?;
+                    sites.insert(site_key, check);
                 }
             }
             Some(other) => return Err(format!("`sites` must be a table, got {other}")),
@@ -520,22 +526,37 @@ impl Config {
         })
     }
 
-    /// The access check that applies to `vhost`.
+    /// The access check that applies to this request's tenant.
     ///
-    /// `vhost` must already have been through [`normalize_vhost`]; the keys
-    /// of `sites` were normalised at parse time, so anything else silently
-    /// misses.
+    /// `site` is [`ephpm_middleware::Request::vhost_id`] verbatim: the router's
+    /// **canonical site key**, or `None` when the request matched no known
+    /// virtual host. It is deliberately *not* re-derived from the `Host`
+    /// header — that was ephpm#390, and this is an authorization decision.
     ///
-    /// When a `sites` table is configured it is authoritative: a vhost with
-    /// no entry gets **no** check and therefore no access, even if a
-    /// top-level `repo` is also set. Falling back would mean a hostname
-    /// nobody mapped quietly inherits some other tenant's rule.
+    /// Three cases, and the `None` one is the reason this takes an `Option`:
+    ///
+    /// * **No `sites` table** — the mount has a single top-level target, so
+    ///   `default_check` applies to whatever is being served. This is the
+    ///   single-site deployment, where `vhost_id()` is always `None` (there are
+    ///   no virtual hosts to match), and it must keep working.
+    /// * **`sites` table, request has a tenant** — exact lookup. When a `sites`
+    ///   table is configured it is authoritative: a vhost with no entry gets
+    ///   **no** check and therefore no access, even if a top-level `repo` is
+    ///   also set. Falling back would mean a site nobody mapped quietly
+    ///   inherits some other tenant's rule.
+    /// * **`sites` table, request has no tenant** — deny. The operator mapped
+    ///   specific vhosts; a request that matched none of them is not one of
+    ///   them, and there is no identity to look up. Substituting the `Host`
+    ///   here would let a caller pick which tenant's rule it is judged by.
+    ///
+    /// The keys of `sites` are lowercased at parse time, which matches the
+    /// router's own site keys (always lowercase).
     #[must_use]
-    pub fn check_for(&self, vhost: &str) -> Option<&Check> {
+    pub fn check_for(&self, site: Option<&str>) -> Option<&Check> {
         if self.sites.is_empty() {
             return self.default_check.as_ref();
         }
-        self.sites.get(vhost)
+        self.sites.get(site?)
     }
 
     /// Paths the gate owns, for the return-to loop check.
@@ -545,48 +566,78 @@ impl Config {
     }
 }
 
-/// Canonicalise the middleware ABI's `request_vhost_id` before it is used as
-/// a key or written into a token.
+/// Normalise a **configured** `sites` key so it can be compared to the
+/// router's canonical site key.
 ///
-/// **This is not cosmetic.** `request_vhost_id` is the router's `SERVER_NAME`
-/// — the raw `Host` header with the port split off and *nothing else*. It is
-/// **not** lowercased, the FQDN-root dot is not stripped, and it is not the
-/// canonical site key that `Router::resolve_site` produces. `Host` is
-/// case-insensitive per RFC 9110 and entirely client-controlled, so without
-/// this a `sites` lookup misses on `Host: PR-1.Preview.Test`, and — worse —
-/// two spellings of the same host would mint sessions with two different
-/// `site` claims and two different derived `redirect_uri`s.
+/// This only has to fix up what an operator might type in `ephpm.toml`
+/// (stray whitespace, capitals, a trailing FQDN-root dot). The *request* side
+/// needs no normalisation at all any more: since ABI minor 3
+/// `request_vhost_id` returns the key `Router::resolve_site` matched, which is
+/// already port-stripped, dot-stripped, lowercased, suffix-stripped and
+/// allowlist-validated (ephpm#390).
 ///
-/// The port is deliberately **not** split off here: the server already
-/// removed it, and splitting on `:` would corrupt an IPv6 literal
-/// (`[::1]` → `[`). If a future ABI change reintroduced the port, the key
-/// would simply stop matching, which fails closed.
-///
-/// `ephpm-server`'s own `normalize_host_key` is `pub(crate)`, so a module
-/// cannot call it; the duplication is forced.
+/// Before minor 3 this function was applied to the *request* value too,
+/// because the ABI handed over the raw `Host` header — client-controlled and
+/// un-normalised — and a `sites` lookup would otherwise miss on
+/// `Host: PR-1.Preview.Test`. That workaround is deleted: re-normalising a
+/// client string is not the same thing as being told which tenant the router
+/// resolved, and only the latter can be trusted for an authorization decision.
 #[must_use]
-pub fn normalize_vhost(raw: &str) -> String {
+pub fn normalize_site_key(raw: &str) -> String {
     raw.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Reject a vhost id that could not appear in a URL authority.
+/// Reject a `sites` key that no canonical site key could ever equal.
 ///
-/// The vhost is interpolated into the derived `redirect_uri`, so it is
-/// attacker-influenced input (it comes from the `Host` header) heading for an
-/// outbound URL.
+/// Mirrors ePHPm's own `is_valid_site_key`: a site key is a vhost **directory
+/// name** under `sites_dir`, so it is non-empty ASCII from `[a-z0-9._-]` and
+/// nothing else. A port, an IPv6 literal, or an upper-case letter can never
+/// appear in one, so a `sites` table still written in terms of request
+/// *hostnames* (`localhost:8080`, `[::1]`) is a configuration error and is
+/// rejected at startup rather than silently never matching.
+///
+/// # Errors
+///
+/// Returns a message when the key is empty, over-long, or contains a character
+/// outside the site-key allowlist.
+pub fn validate_site_key(key: &str) -> Result<(), String> {
+    let ok = !key.is_empty()
+        && key.len() <= 253
+        && key.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "{key:?} is not a usable site key — `sites` is keyed by the vhost DIRECTORY name \
+             the router resolves (lowercase `[a-z0-9._-]`), not by a request hostname; with a \
+             `sites_domain_suffix` of `.preview.example.com` the key for \
+             `pr-1.preview.example.com` is `pr-1`"
+        ))
+    }
+}
+
+/// Reject a request host that could not appear in a URL authority.
+///
+/// This guards the host interpolated into the **derived `redirect_uri`**,
+/// which is the one place the module still uses the request host rather than
+/// the tenant identity: the site key is suffix-stripped and is therefore not a
+/// routable authority, whereas `redirect_uri` has to be a URL GitHub will
+/// redirect a browser back to. The value comes from the `Host` header (via
+/// `request_host`), so it is attacker-influenced input heading for an outbound
+/// URL — hence the allowlist. A port and an IPv6 literal are legal here.
 ///
 /// # Errors
 ///
 /// Returns a message when the name is empty, over-long, non-ASCII, or
 /// contains anything outside the host/port character set.
-pub fn validate_vhost(host: &str) -> Result<(), String> {
+pub fn validate_redirect_host(host: &str) -> Result<(), String> {
     let ok = !host.is_empty()
         && host.len() <= 253
         && host.is_ascii()
         && host
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '[' | ']'));
-    if ok { Ok(()) } else { Err(format!("{host:?} is not a usable virtual-host name")) }
+    if ok { Ok(()) } else { Err(format!("{host:?} is not a usable request host")) }
 }
 
 #[cfg(test)]
@@ -723,47 +774,78 @@ mod tests {
     fn sites_table_is_authoritative_when_present() {
         let mut v = base();
         v["sites"] = serde_json::json!({
-            "pr-1.preview.example.com": { "repo": "acme/web" },
-            "PR-2.preview.example.com": { "org": "acme" },
+            "pr-1": { "repo": "acme/web" },
+            "PR-2": { "org": "acme" },
         });
         let c = parse(v).expect("parse");
         assert_eq!(
-            c.check_for("pr-1.preview.example.com"),
+            c.check_for(Some("pr-1")),
             Some(&Check::Repo { owner: "acme".into(), name: "web".into() })
         );
         // A `sites` KEY written in mixed case is normalised at parse time.
-        assert_eq!(
-            c.check_for("pr-2.preview.example.com"),
-            Some(&Check::Org { org: "acme".into() })
-        );
-        // An unmapped vhost gets nothing — it does NOT inherit the top-level
+        assert_eq!(c.check_for(Some("pr-2")), Some(&Check::Org { org: "acme".into() }));
+        // An unmapped site gets nothing — it does NOT inherit the top-level
         // `repo`, which is also set in this config.
-        assert_eq!(c.check_for("pr-99.preview.example.com"), None);
+        assert_eq!(c.check_for(Some("pr-99")), None);
     }
 
+    /// ePHPm #390 / #448. With a `sites` table configured, a request that
+    /// matched **no** virtual host has no tenant identity and must be denied —
+    /// not silently handed the top-level `repo` (that would let an
+    /// unrecognised `Host` inherit a real tenant's rule), and not looked up
+    /// under some `Host`-derived string.
     #[test]
-    fn vhost_normalisation_closes_the_case_bypass() {
-        // `request_vhost_id` is the RAW `Host` header. Without normalisation
-        // a client picks its own key by changing a letter's case, and mints
-        // sessions whose `site` claim disagrees with everyone else's.
-        for raw in [
-            "PR-1.Preview.Example.COM",
-            "pr-1.preview.example.com.",
-            "  pr-1.preview.example.com  ",
-            "PR-1.PREVIEW.EXAMPLE.COM.",
-        ] {
-            assert_eq!(normalize_vhost(raw), "pr-1.preview.example.com", "{raw:?}");
-        }
-        // An IPv6 literal survives: the port is already gone, and splitting
-        // on ':' here would truncate it to "[".
-        assert_eq!(normalize_vhost("[::1]"), "[::1]");
-        assert!(validate_vhost(&normalize_vhost("[::1]")).is_ok());
-
+    fn an_untenanted_request_is_denied_when_sites_is_configured() {
         let mut v = base();
-        v["sites"] = serde_json::json!({ "PR-1.Preview.Example.COM": { "repo": "acme/web" } });
+        v["sites"] = serde_json::json!({ "pr-1": { "repo": "acme/web" } });
         let c = parse(v).expect("parse");
-        assert!(c.check_for(&normalize_vhost("pr-1.PREVIEW.example.com")).is_some());
-        assert!(c.check_for(&normalize_vhost("PR-1.preview.example.com.")).is_some());
+        assert!(c.default_check.is_some(), "the top-level `repo` from base() is set");
+        assert_eq!(c.check_for(None), None, "no tenant + a sites table must deny");
+    }
+
+    /// The single-site deployment: no `sites` table, so the one top-level
+    /// target applies to every request. `vhost_id()` is always `None` on a node
+    /// with no virtual hosts, so this is the *normal* path there and must not
+    /// be caught by the fail-closed branch above.
+    #[test]
+    fn an_untenanted_request_uses_the_default_check_when_sites_is_absent() {
+        let c = parse(base()).expect("parse");
+        assert_eq!(
+            c.check_for(None),
+            Some(&Check::Repo { owner: "acme".into(), name: "web".into() })
+        );
+    }
+
+    /// The router hands over one canonical key per tenant, so the module no
+    /// longer re-normalises a client string — but an operator still types the
+    /// `sites` keys by hand, and those are normalised at parse time.
+    #[test]
+    fn configured_site_keys_are_normalised_at_parse_time() {
+        for raw in ["PR-1", "pr-1.", "  pr-1  ", "PR-1."] {
+            assert_eq!(normalize_site_key(raw), "pr-1", "{raw:?}");
+        }
+        let mut v = base();
+        v["sites"] = serde_json::json!({ "  PR-1.  ": { "repo": "acme/web" } });
+        let c = parse(v).expect("parse");
+        assert!(c.check_for(Some("pr-1")).is_some());
+    }
+
+    /// A `sites` table still written in request-hostname terms is a
+    /// configuration error, and fails the mount at startup rather than
+    /// silently never matching a site key.
+    #[test]
+    fn a_sites_key_that_cannot_be_a_site_key_fails_the_mount() {
+        for bad in ["localhost:8080", "[::1]", "pr 1", "pr/1", "caf\u{e9}"] {
+            let mut v = base();
+            v["sites"] = serde_json::json!({ bad: { "repo": "acme/web" } });
+            let err = parse(v).expect_err(&format!("{bad:?} must be refused"));
+            assert!(err.contains("not a usable site key"), "{bad:?}: {err}");
+        }
+        // A dotted name is still legal: it is a legal vhost DIRECTORY name, so
+        // a deployment without `sites_domain_suffix` really does key on it.
+        let mut v = base();
+        v["sites"] = serde_json::json!({ "pr-1.preview.example.com": { "repo": "acme/web" } });
+        assert!(parse(v).is_ok());
     }
 
     #[test]
@@ -818,12 +900,16 @@ mod tests {
         assert!(parse(v).expect_err("weak bypass").contains("at least 32 bytes"));
     }
 
+    /// The guard on the host that goes into the derived `redirect_uri` — an
+    /// outbound URL authority, so a port and an IPv6 literal are legal here
+    /// even though neither can appear in a site key.
     #[test]
-    fn vhost_validation() {
-        assert!(validate_vhost("pr-1.preview.example.com").is_ok());
-        assert!(validate_vhost("localhost:8080").is_ok());
+    fn redirect_host_validation() {
+        assert!(validate_redirect_host("pr-1.preview.example.com").is_ok());
+        assert!(validate_redirect_host("localhost:8080").is_ok());
+        assert!(validate_redirect_host("[::1]").is_ok());
         for bad in ["", "has space", "evil.test/path", "a@b", "caf\u{e9}.test", "x\r\ny"] {
-            assert!(validate_vhost(bad).is_err(), "{bad:?}");
+            assert!(validate_redirect_host(bad).is_err(), "{bad:?}");
         }
     }
 }
