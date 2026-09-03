@@ -54,11 +54,62 @@ config  = { secret = "env:EPHPM_SESSION_SECRET", cookie = "ephpm_session",
 | session cookie present | verifier checks it: `CONTINUE`, or `302` → login | no network |
 
 The issued session is a **compact HS256 JWT** carrying the GitHub login, the
-vhost it was issued for, how it was obtained, and an expiry — no server-side
+site it was issued for, how it was obtained, and an expiry — no server-side
 session record, so restarts and second nodes log nobody out. The issuer's three
 GitHub calls per login are: `POST /login/oauth/access_token` (code → token),
 `GET /user` (the identity), and the access check (`GET /repos/{owner}/{name}`,
 `/user/memberships/orgs/{org}`, or a team-membership call).
+
+## Tenancy: the site key, not the `Host` header
+
+Both modules take the request's tenant identity from `req.vhost_id()`, which
+since ePHPm's middleware **ABI minor 3**
+([#448](https://github.com/ephpm/ephpm/pull/448), issue
+[#390](https://github.com/ephpm/ephpm/issues/390)) is the **canonical site key**
+the router resolved — the vhost directory name — rather than the raw `Host`
+header. Two values that used to be one are now kept apart:
+
+| | value | used for |
+|---|---|---|
+| **site key** (`req.vhost_id()`) | `pr-1` | the `sites` access check, the OAuth `state` binding, the session's `site` claim |
+| **request host** (`req.http_host()`) | `pr-1.preview.example.com` | the derived `redirect_uri`, and nothing else |
+
+With a `sites_domain_suffix` of `.preview.example.com` those differ, and the
+difference matters in both directions: the site key is the tenant boundary (the
+same identity that picks the per-site database and KV keyspace), and it is
+*not* a routable authority — a `redirect_uri` of `https://pr-1/…` would go
+nowhere.
+
+Consequences worth knowing before you upgrade:
+
+- **`sites` keys are site keys now.** `sites = { "pr-1" = {…} }`, not
+  `"pr-1.preview.example.com"`. A key that could never *be* a site key — one
+  with a port, an IPv6 literal, an upper-case letter that does not lowercase to
+  a legal key — now **fails the mount at startup** rather than silently never
+  matching. A dotted key is still accepted, because a deployment without
+  `sites_domain_suffix` really does key on the full name.
+- **Every spelling of a host is one tenant.** `PR-1.Preview.Test`,
+  `pr-1.preview.test:8443` and `pr-1.preview.test.` collapse upstream, so the
+  case-variant `sites` miss that #390 describes is gone — and the modules no
+  longer re-normalise the header themselves.
+- **A request that matched no vhost has no tenant.** With a `sites` table it is
+  denied; without one (the single-site deployment, where `vhost_id()` is always
+  `None`) the top-level `repo`/`org`/`team` applies as before. Its session
+  binds to the constant `_UNMATCHED`, never to something the client sent.
+- **Sessions issued before the upgrade name the old identity.** They stay
+  signature-valid, but their `site` claim is the old host-shaped string. Users
+  log in again once.
+
+### Not fixed here: the verifier ignores the `site` claim
+
+The issuer binds each session to one tenant; `session-cookie` verifies the
+signature and expiry but **does not compare the `site` claim to the request's
+site**. On a multi-tenant node a session issued for one preview therefore
+verifies on every other preview served by the same mount — ePHPm
+[#396](https://github.com/ephpm/ephpm/issues/396), which is open. ABI minor 3
+is what makes the comparison meaningful (before it, the only available identity
+was client-controlled), so the fix is now possible; making it, and deciding
+what to do with a `site`-less share token, is #396's call.
 
 **Access is unrevocable until it expires** — that is the cost of a
 self-contained token. `session_ttl_secs` (default 8h) is therefore the blast
@@ -76,7 +127,7 @@ defaults are in [`config.rs`](crates/ephpm-middleware-github-auth/src/config.rs)
 | `client_secret` | **required** | client secret — use `env:NAME`, never a literal |
 | `session_secret` | **required, ≥32 bytes** | HMAC key for the session token; must match the verifier's `secret` |
 | `repo` / `org` / `team` | one is required | the access target: read access to `owner/name`, active org membership, or active team membership |
-| `sites` | unset | per-vhost table mapping each preview hostname to its own target (authoritative when present) |
+| `sites` | unset | per-tenant table mapping each **canonical site key** to its own target (authoritative when present) — see [Tenancy](#tenancy-the-site-key-not-the-host-header) |
 | `session_ttl_secs` | `28800` | session lifetime (60 … 604800) |
 | `bypass_token` | unset | pre-shared token (≥32 bytes) letting CI reach a preview headlessly; presenting it mints a normal session |
 | `github_base` / `github_api_base` | `https://github.com` / `https://api.github.com` | override for GitHub Enterprise Server |
@@ -110,11 +161,19 @@ a test pinning it (`the_gate_denies_a_static_asset_before_it_is_read` /
 ## Distribution
 
 There is **none** — this repo has no release workflow, no prebuilt `.so`, no
-checksums or manifest. It is source the **preview build compiles in** (the
-`switchboard` preview control plane and the `wordpress-sample` PR-preview app)
-via a git dependency / vendored source and a `[[middleware]]` mount. The
-official in-tree modules (`jwt`, `cors`, `ratelimit`, …) ship inside the ePHPm
-binary; this gate is preview-only infrastructure and lives here instead.
+checksums or manifest. It is intended as source a preview build compiles in, via
+a git dependency / vendored source and a `[[middleware]]` mount. The official
+in-tree modules (`jwt`, `cors`, `ratelimit`, …) ship inside the ePHPm binary;
+this gate is preview-only infrastructure and lives here instead.
+
+**No deployment mounts it yet.** An earlier revision of this section named
+`switchboard` and `wordpress-sample` as compiling it in; as of 2026-09-02
+neither does, and neither has ever had a `[[middleware]]` mount in its history.
+The generated `/etc/ephpm/ephpm.toml` in `switchboard-infra`'s StackScript sets
+only `[server]` and `[db.sqlite]`. `switchboard`'s own preview-app guide still
+tells users to "assume your preview URL is public". Treat this repo as
+not-yet-deployed infrastructure rather than as something with live consumers —
+which is also why the `sites` key-form change below has no config to migrate.
 
 The trade-off of the `dlopen`'d cdylib form: a fully static (musl) ePHPm cannot
 `dlopen`, so it cannot load these; the stock glibc-dynamic Linux release can. A
@@ -126,8 +185,15 @@ Both modules build against the `ephpm-middleware` ABI as a **git dependency
 pinned by `rev`** to ePHPm `main` (see the workspace
 [`Cargo.toml`](Cargo.toml)) — the same way ePHPm pins litewire. A drift in
 `EphpmHostV1` / `ABI_V1` would be silent UB at the FFI boundary, so the pin is
-exact. The pinned rev is past #408 (the static-path request phase) and does not
-depend on the request-scheme accessor proposed in #409 (not merged).
+exact.
+
+The pin is at **ABI major 1, minor 3**. It is past
+[#408](https://github.com/ephpm/ephpm/pull/408) (the static-path request phase
+both modules rely on) and past
+[#448](https://github.com/ephpm/ephpm/pull/448), which is what gives
+`vhost_id()` its canonical-site-key meaning and adds `http_host()` — see
+[Tenancy](#tenancy-the-site-key-not-the-host-header). To rebuild against a newer
+host, replace the `rev` and `cargo update`.
 
 ## Build & test
 

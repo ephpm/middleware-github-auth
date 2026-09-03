@@ -89,17 +89,59 @@
 //! # Sessions are self-contained
 //!
 //! The session is an HS256 JWT (see [`token`]) carrying its subject, the
-//! vhost it was issued for, how it was obtained, and an expiry. There is no
+//! **site** it was issued for, how it was obtained, and an expiry. There is no
 //! server-side session record: restarts do not log anyone out, a second node
 //! needs no replication, and the module never touches the middleware KV
-//! surface — which is process-global rather than per-site (ephpm#376) and
-//! therefore the wrong place for anything tenant-scoped.
+//! surface at all. (Since ePHPm#376 that surface *is* per-site by default, so
+//! the old reason to avoid it — it was process-global — is gone; the reason
+//! that remains is simply that a self-contained token needs no storage.)
 //!
 //! The cost of that, stated plainly: **an issued session cannot be revoked
 //! before it expires.** Rotating `session_secret` invalidates every session
 //! at once and is the only revocation available. `session_ttl_secs` is
 //! therefore the blast radius of a stolen cookie, and it defaults to eight
 //! hours.
+//!
+//! Note also what the **verifier** does not do with the `site` claim this
+//! module writes: `session-cookie` checks the signature and the expiry but not
+//! the tenant binding, so a session issued for one preview verifies on every
+//! preview served by the same mount. That is ePHPm
+//! [#396](https://github.com/ephpm/ephpm/issues/396), it is open, and the
+//! binding written here is the half of the fix that already exists.
+//!
+//! # The `site` claim is the canonical site key (ePHPm #390 / #448)
+//!
+//! Since middleware ABI minor 3, `Request::vhost_id()` returns the tenant
+//! identity the **router** resolved — the vhost directory name — and `None`
+//! for a request that matched no virtual host. This module uses that value and
+//! nothing else for tenancy: the `sites` access check, the OAuth `state`
+//! binding, and the token's `site` claim.
+//!
+//! What that buys, concretely:
+//!
+//! * `Host: PR-1.Preview.Test`, `pr-1.preview.test:8443` and
+//!   `pr-1.preview.test.` are **one** tenant, not three. Before minor 3 this
+//!   module had to re-normalise the header itself to get even that far, and a
+//!   local re-normalisation is a guess about what the router did, not the
+//!   router's answer.
+//! * A request whose `Host` matched no vhost has **no** tenant identity, and
+//!   cannot be given one by sending a different `Host`. It gets the single
+//!   constant `_UNMATCHED` ([`ephpm_middleware::UNMATCHED_VHOST`]) — and if a
+//!   `sites` table is configured it is denied outright, because a request that
+//!   matched none of the mapped vhosts is not one of them.
+//!
+//! The request host is still available, and is still used for exactly one
+//! thing: the derived `redirect_uri`, which must be an authority a browser can
+//! be redirected back to. See [`GithubAuth::invoke`].
+//!
+//! **Upgrade note.** `sites` is now keyed by the site key, not the request
+//! hostname — with `sites_domain_suffix = ".preview.example.com"` the key for
+//! `pr-1.preview.example.com` is `pr-1`. A `sites` table still written in
+//! hostname terms will fail startup validation if the key cannot be a site key
+//! at all (a port, an IPv6 literal), and will otherwise simply never match, so
+//! **check `sites` when upgrading**. Sessions issued before the upgrade carry
+//! the old host-shaped `site` claim; they remain signature-valid but name a
+//! tenant that no longer exists under that spelling.
 //!
 //! # Share links, for free
 //!
@@ -200,6 +242,66 @@ pub enum Route {
     HasSession,
 }
 
+/// Which tenant a request belongs to, as this gate uses it.
+///
+/// A thin wrapper over [`Request::vhost_id`] whose only job is to keep the two
+/// uses of that value distinguishable, because they want different things from
+/// an absent tenant:
+///
+/// * the `sites` access-check lookup, which must **fail** when there is no
+///   tenant to look up — [`SiteIdentity::key`];
+/// * the session token's `site` claim and the OAuth `state` binding, which need
+///   *a* string and must never be given a client-supplied one —
+///   [`SiteIdentity::claim`].
+///
+/// Before ABI minor 3 there was no distinction to make: the ABI handed over the
+/// raw `Host` header, so "no tenant" and "someone sent `Host: pr-1`" were the
+/// same string (ephpm#390).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiteIdentity {
+    /// The router matched a virtual host; this is its canonical site key.
+    Tenant(String),
+    /// The request matched **no** known virtual host. On a multi-tenant node
+    /// that is an unrecognised `Host`; on a single-site node it is simply every
+    /// request, because there are no virtual hosts to match.
+    Untenanted,
+}
+
+impl SiteIdentity {
+    /// Read the request's tenant identity. The one place `vhost_id()` is
+    /// called.
+    #[must_use]
+    pub fn of(req: &Request<'_>) -> Self {
+        req.vhost_id().map_or(Self::Untenanted, |key| Self::Tenant(key.to_owned()))
+    }
+
+    /// The `sites` lookup key — `None` when there is no tenant, so
+    /// [`Config::check_for`] denies rather than guessing.
+    #[must_use]
+    pub fn key(&self) -> Option<&str> {
+        match self {
+            Self::Tenant(key) => Some(key),
+            Self::Untenanted => None,
+        }
+    }
+
+    /// The string bound into the `site` claim and the OAuth `state`.
+    ///
+    /// For an untenanted request this is the constant
+    /// [`ephpm_middleware::UNMATCHED_VHOST`] — uppercase, and therefore
+    /// unspellable as a site key, so a session bound to it can never be
+    /// confused with one bound to a real tenant, and two different unrecognised
+    /// hostnames cannot mint two different identities for what is one and the
+    /// same default document root.
+    #[must_use]
+    pub fn claim(&self) -> &str {
+        match self {
+            Self::Tenant(key) => key,
+            Self::Untenanted => ephpm_middleware::UNMATCHED_VHOST,
+        }
+    }
+}
+
 /// The gate.
 pub struct GithubAuth {
     config: Config,
@@ -256,7 +358,7 @@ impl GithubAuth {
     /// | `sub` | GitHub login, or the bypass subject |
     /// | `aud` | `audience`, when configured |
     /// | `exp` / `iat` | expiry / issue time, seconds since the epoch |
-    /// | `site` | the vhost this session is for — a session for one preview must not open another |
+    /// | `site` | the tenant this session is for — the **canonical site key** since ABI minor 3, or `_UNMATCHED` for a request that matched no vhost |
     /// | `via` | `"github"` or `"bypass"`; an external minter uses `"share"` |
     /// | `gh_id` | numeric GitHub account id (stable across renames), for `via = "github"` |
     /// | `check` | the rule that was satisfied, e.g. `repo acme/web` — for audit |
@@ -292,21 +394,33 @@ impl GithubAuth {
     }
 
     /// Build the `redirect_uri` for this request.
-    fn redirect_uri(&self, vhost: &str) -> String {
+    ///
+    /// `host` is the **request host**, not the site key: this is a URL GitHub
+    /// redirects a browser back to, and a suffix-stripped site key (`pr-1`) is
+    /// not a routable authority. See the note in [`GithubAuth::invoke`].
+    fn redirect_uri(&self, host: &str) -> String {
         self.config
             .redirect_uri
             .clone()
-            .unwrap_or_else(|| format!("https://{vhost}{}", self.config.callback_path))
+            .unwrap_or_else(|| format!("https://{host}{}", self.config.callback_path))
     }
 
     /// 302 to GitHub's authorize endpoint, with a fresh signed `state`.
-    fn start_login(&self, req: &Request<'_>, vhost: &str, return_to: &str, now: u64) -> Response {
-        let Some(check) = self.config.check_for(vhost) else {
+    fn start_login(
+        &self,
+        req: &Request<'_>,
+        site: &SiteIdentity,
+        host: &str,
+        return_to: &str,
+        now: u64,
+    ) -> Response {
+        let vhost = site.claim();
+        let Some(check) = self.config.check_for(site.key()) else {
             log(
                 req,
                 LOG_WARN,
                 &format!(
-                    "github-auth: refusing login for vhost {vhost:?} — it has no `sites` entry and \
+                    "github-auth: refusing login for site {vhost:?} — it has no `sites` entry and \
                  no default target, so there is nothing to check access against"
                 ),
             );
@@ -330,7 +444,7 @@ impl GithubAuth {
             "{}/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&response_type=code",
             self.config.github_base,
             encode_query(&self.config.client_id),
-            encode_query(&self.redirect_uri(vhost)),
+            encode_query(&self.redirect_uri(host)),
             encode_query(&nonce),
         );
         if !self.config.scopes.is_empty() {
@@ -341,10 +455,7 @@ impl GithubAuth {
         log(
             req,
             LOG_INFO,
-            &format!(
-                "github-auth: starting login for vhost {vhost:?} against {}",
-                check.describe()
-            ),
+            &format!("github-auth: starting login for site {vhost:?} against {}", check.describe()),
         );
         redirect_to(&url).header(
             "Set-Cookie",
@@ -367,7 +478,14 @@ impl GithubAuth {
     /// module talk to GitHub at all, which is what keeps the callback from
     /// being an amplification endpoint.
     #[allow(clippy::too_many_lines, reason = "one linear flow, each step guarded")]
-    fn handle_callback(&self, req: &Request<'_>, vhost: &str, now: u64) -> Response {
+    fn handle_callback(
+        &self,
+        req: &Request<'_>,
+        site: &SiteIdentity,
+        host: &str,
+        now: u64,
+    ) -> Response {
+        let vhost = site.claim();
         let query = req.query();
         let clear_state =
             set_cookie(&self.config.state_cookie_name, "", 0, &self.config.cookie_attrs);
@@ -414,8 +532,9 @@ impl GithubAuth {
             return deny(400, "This login link is not valid here. Start again.")
                 .header("Set-Cookie", clear_state);
         }
-        // The state is bound to the vhost it was issued on, so a state minted
-        // for one tenant cannot complete a login on another.
+        // The state is bound to the SITE it was issued on — the canonical site
+        // key, so every spelling of one vhost is one binding — and a state
+        // minted for one tenant cannot complete a login on another.
         if state_claims.get("v").and_then(serde_json::Value::as_str) != Some(vhost) {
             log(req, LOG_WARN, "github-auth: OAuth state was issued for a different host");
             return deny(400, "This login link is not valid here. Start again.")
@@ -429,7 +548,7 @@ impl GithubAuth {
             &self.config.reserved_paths(),
         );
 
-        let Some(check) = self.config.check_for(vhost) else {
+        let Some(check) = self.config.check_for(site.key()) else {
             return deny(403, "This preview is not configured for GitHub access control.")
                 .header("Set-Cookie", clear_state);
         };
@@ -442,7 +561,7 @@ impl GithubAuth {
 
         // ── The only network calls in the module ─────────────────────────
         let outcome =
-            self.github.exchange_code(&code, &self.redirect_uri(vhost)).and_then(|access| {
+            self.github.exchange_code(&code, &self.redirect_uri(host)).and_then(|access| {
                 let user = self.github.current_user(&access)?;
                 let allowed = self.github.check_access(&access, check, &user)?;
                 Ok((user, allowed))
@@ -464,7 +583,7 @@ impl GithubAuth {
                 req,
                 LOG_INFO,
                 &format!(
-                    "github-auth: denied {} on vhost {vhost:?} — no access to {}",
+                    "github-auth: denied {} on site {vhost:?} — no access to {}",
                     user.login,
                     check.describe()
                 ),
@@ -475,7 +594,7 @@ impl GithubAuth {
 
         self.issue(
             req,
-            vhost,
+            site,
             &user.login,
             "github",
             Some(user.id),
@@ -492,7 +611,7 @@ impl GithubAuth {
     fn issue(
         &self,
         req: &Request<'_>,
-        vhost: &str,
+        site: &SiteIdentity,
         subject: &str,
         via: &str,
         gh_id: Option<u64>,
@@ -501,6 +620,7 @@ impl GithubAuth {
         ttl: u64,
         return_to: &str,
     ) -> Response {
+        let vhost = site.claim();
         let claims = self.session_claims(subject, vhost, via, gh_id, check, now, ttl);
         let Some(session) = token::mint(self.config.session_secret.expose(), &claims) else {
             log(req, LOG_ERROR, "github-auth: could not mint the session token");
@@ -562,13 +682,23 @@ impl Middleware for GithubAuth {
     fn invoke(&self, req: &Request<'_>) -> Response {
         self.banner(req);
 
-        // Canonicalise ONCE, here, and use only this value below — as the
-        // `sites` key, in the `site` claim, in the state binding and in the
-        // derived `redirect_uri`. `request_vhost_id` is the raw `Host`
-        // header; see `config::normalize_vhost` for why that matters.
-        let vhost = config::normalize_vhost(req.vhost_id());
-        let vhost = vhost.as_str();
-        if config::validate_vhost(vhost).is_err() {
+        // Two DIFFERENT values, resolved once here, never re-derived below.
+        //
+        // `site` is the tenant identity — the router's canonical site key
+        // (ABI minor 3, ephpm#390). It selects the `sites` access check, binds
+        // the OAuth `state`, and becomes the token's `site` claim. `None` means
+        // the request matched no virtual host; `SiteIdentity` carries that
+        // through rather than papering over it with the `Host` header.
+        let site = SiteIdentity::of(req);
+        //
+        // `host` is the request host as sent (normalised: port and trailing dot
+        // stripped, lowercased). It is NOT a tenant identity and is used for
+        // exactly one thing — building the derived `redirect_uri`, which has to
+        // be a URL a browser can come back to. The site key cannot serve there:
+        // with a `sites_domain_suffix` it is the suffix-stripped directory name
+        // (`pr-1`), not a routable authority (`pr-1.preview.example.com`).
+        let host = req.http_host();
+        if config::validate_redirect_host(host).is_err() {
             log(req, LOG_WARN, "github-auth: request with an unusable Host header — rejected");
             return deny(400, "Bad request.");
         }
@@ -579,8 +709,8 @@ impl Middleware for GithubAuth {
 
         match self.route(req.path(), req.query(), cookies, bypass.as_deref()) {
             Route::HasSession => Response::cont(),
-            Route::StartLogin { return_to } => self.start_login(req, vhost, &return_to, now),
-            Route::Callback => self.handle_callback(req, vhost, now),
+            Route::StartLogin { return_to } => self.start_login(req, &site, host, &return_to, now),
+            Route::Callback => self.handle_callback(req, &site, host, now),
             Route::Bypass => {
                 let return_to = redirect::sanitize_return_to(
                     &here(req.path(), req.query()),
@@ -588,7 +718,7 @@ impl Middleware for GithubAuth {
                 );
                 self.issue(
                     req,
-                    vhost,
+                    &site,
                     "automation",
                     "bypass",
                     None,
@@ -728,6 +858,17 @@ mod tests {
     const SESSION_SECRET: &str = "0123456789abcdef0123456789abcdef";
     const BYPASS: &str = "bypass-token-that-is-long-enough-32";
 
+    /// The two values ABI minor 3 keeps apart, and the tests with them.
+    ///
+    /// A preview node runs with `sites_domain_suffix = ".preview.test"`, so the
+    /// browser asks for `pr-1.preview.test` (the request host, and the only
+    /// authority a `redirect_uri` can name) and the router resolves it to the
+    /// vhost directory `pr-1` (the tenant identity, and the only thing the
+    /// `sites` table and the `site` claim may be keyed on). Before minor 3 the
+    /// module saw one string for both jobs and had to use it for both.
+    const SITE: &str = "pr-1";
+    const HOST: &str = "pr-1.preview.test";
+
     fn gate(extra: serde_json::Value) -> GithubAuth {
         let mut cfg = serde_json::json!({
             "client_id": "Iv1.test",
@@ -745,7 +886,26 @@ mod tests {
     }
 
     fn invoke(mw: &GithubAuth, path: &str, query: &str, headers: &[(String, String)]) -> Response {
-        let ctx = RequestCtx::new("GET", path, query, "203.0.113.9", "pr-1.preview.test", headers);
+        invoke_on(mw, SITE, HOST, path, query, headers)
+    }
+
+    /// As [`invoke`], with the request's canonical site key and request host
+    /// spelled out separately.
+    ///
+    /// `site` is `RequestCtx`'s fifth argument, which since ABI minor 3 is the
+    /// site key; the **empty string** is how the host says "this request
+    /// matched no virtual host" (the C accessor turns it into a NULL, so
+    /// `vhost_id()` is `None`). `host` is the normalized request host the
+    /// router would have computed from the `Host` header.
+    fn invoke_on(
+        mw: &GithubAuth,
+        site: &str,
+        host: &str,
+        path: &str,
+        query: &str,
+        headers: &[(String, String)],
+    ) -> Response {
+        let ctx = RequestCtx::new("GET", path, query, "203.0.113.9", site, headers).with_host(host);
         // SAFETY: `ctx` outlives the borrow; `host_table()` is 'static.
         let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
         mw.invoke(&req)
@@ -880,11 +1040,78 @@ mod tests {
 
     #[test]
     fn an_unmapped_vhost_is_denied_rather_than_defaulted() {
-        let mw = gate(serde_json::json!({
-            "sites": { "pr-2.preview.test": { "repo": "acme/other" } },
-        }));
+        let mw = gate(serde_json::json!({ "sites": { "pr-2": { "repo": "acme/other" } } }));
         let resp = invoke(&mw, "/", "", &[]);
-        assert_eq!(resp.__status(), 403, "an unmapped host must not inherit another tenant's rule");
+        assert_eq!(resp.__status(), 403, "an unmapped site must not inherit another tenant's rule");
+    }
+
+    /// ePHPm #390 / #448. The `sites` table is keyed on the **canonical site
+    /// key**, so it is looked up with the tenant the router resolved and never
+    /// with anything the client typed. Two halves:
+    ///
+    /// * every spelling of one vhost resolves to one key upstream, so the
+    ///   module sees one identity and no case- or dot-variant can miss an
+    ///   entry (the bypass ePHPm#390 names);
+    /// * a request that matched **no** vhost is denied outright, rather than
+    ///   being looked up under an attacker-supplied `Host` — even though the
+    ///   request host still names a mapped site.
+    #[test]
+    fn the_sites_table_is_keyed_on_the_router_s_site_key_not_the_host_header() {
+        let mw = gate(serde_json::json!({ "sites": { "pr-1": { "repo": "acme/web" } } }));
+
+        // Mapped tenant: allowed, whatever the client spelled in `Host`. The
+        // router already collapsed the spellings; the module just uses the key.
+        for host in ["pr-1.preview.test", "PR-1.Preview.Test", "pr-1.preview.test."] {
+            let resp = invoke_on(&mw, "pr-1", host, "/", "", &[]);
+            assert_eq!(resp.__status(), 302, "site pr-1 via Host {host:?} must start a login");
+        }
+
+        // No vhost matched. The `Host` still *reads* like a mapped site, and
+        // that must count for nothing: there is no tenant to check access for.
+        let resp = invoke_on(&mw, "", "pr-1.preview.test", "/", "", &[]);
+        assert_eq!(
+            resp.__status(),
+            403,
+            "a request that matched no vhost must not be judged by a mapped tenant's rule"
+        );
+    }
+
+    /// The single-site deployment. A node with no `sites_dir` has no virtual
+    /// hosts, so `vhost_id()` is `None` on every request — the gate must fall
+    /// back to the top-level target rather than treating that as "no tenant,
+    /// deny", which would black-hole the whole site.
+    #[test]
+    fn a_single_site_node_still_logs_in_with_no_sites_table() {
+        let mw = gate(serde_json::json!({}));
+        let resp = invoke_on(&mw, "", "app.example", "/secret.php", "", &[]);
+        assert_eq!(resp.__status(), 302, "single-site: the top-level `repo` applies");
+        let location = header(&resp, "Location").expect("Location");
+        assert!(
+            location.contains(
+                "redirect_uri=https%3A%2F%2Fapp.example%2F_ephpm%2Fauth%2Fgithub%2Fcallback"
+            ),
+            "redirect_uri still derives from the request host: {location}"
+        );
+    }
+
+    /// The `redirect_uri` is built from the request **host**, not the site key.
+    /// With a `sites_domain_suffix` the key is the suffix-stripped directory
+    /// name (`pr-1`), which is not an authority a browser can be redirected
+    /// back to — using it would send GitHub to `https://pr-1/…`.
+    #[test]
+    fn the_redirect_uri_uses_the_request_host_not_the_site_key() {
+        let mw = gate(serde_json::json!({}));
+        let location = header(&invoke(&mw, "/", "", &[]), "Location").expect("Location");
+        assert!(
+            location.contains(
+                "redirect_uri=https%3A%2F%2Fpr-1.preview.test%2F_ephpm%2Fauth%2Fgithub%2Fcallback"
+            ),
+            "{location}"
+        );
+        assert!(
+            !location.contains("https%3A%2F%2Fpr-1%2F"),
+            "the site key is not a routable authority: {location}"
+        );
     }
 
     // ── callback: CSRF ──────────────────────────────────────────────────
@@ -937,7 +1164,7 @@ mod tests {
         let other = token::derive_key(b"a-completely-different-secret-key", token::STATE_KEY_LABEL);
         let forged = token::mint(
             &other,
-            &serde_json::json!({ "n": "abc", "rt": "/", "v": "pr-1.preview.test", "exp": unix_now() + 300 }),
+            &serde_json::json!({ "n": "abc", "rt": "/", "v": SITE, "exp": unix_now() + 300 }),
         )
         .expect("mint");
         let headers = vec![("Cookie".to_owned(), format!("ephpm_session_oauth={forged}"))];
@@ -946,24 +1173,65 @@ mod tests {
     }
 
     #[test]
-    fn callback_state_is_bound_to_the_host_it_was_issued_on() {
+    fn callback_state_is_bound_to_the_site_it_was_issued_on() {
+        let mw = gate(serde_json::json!({}));
+        // A state minted for another SITE key. Note the binding is on the
+        // canonical key since ABI minor 3, so this can no longer be dodged by
+        // varying the `Host` spelling — the router collapses those first.
+        for other in ["pr-2", ephpm_middleware::UNMATCHED_VHOST] {
+            let state_token = token::mint(
+                mw.config.state_secret.expose(),
+                &serde_json::json!({
+                    "n": "nonce-value", "rt": "/", "v": other,
+                    "exp": unix_now() + 300,
+                }),
+            )
+            .expect("mint");
+            let headers = vec![("Cookie".to_owned(), format!("ephpm_session_oauth={state_token}"))];
+            let resp =
+                invoke(&mw, "/_ephpm/auth/github/callback", "code=abc&state=nonce-value", &headers);
+            assert_eq!(
+                resp.__status(),
+                400,
+                "a state minted for {other:?} must not complete on {SITE:?}"
+            );
+        }
+    }
+
+    /// The untenanted bucket is one bucket, not one per `Host`: a state minted
+    /// on an unrecognised host completes on any other unrecognised host,
+    /// because they are all the same (default) document root — and it does
+    /// **not** complete on a real tenant.
+    #[test]
+    fn the_untenanted_bucket_is_one_identity_not_one_per_host() {
         let mw = gate(serde_json::json!({}));
         let state_token = token::mint(
             mw.config.state_secret.expose(),
             &serde_json::json!({
-                "n": "nonce-value", "rt": "/", "v": "other.preview.test",
+                "n": "nonce-value", "rt": "/",
+                "v": ephpm_middleware::UNMATCHED_VHOST,
                 "exp": unix_now() + 300,
             }),
         )
         .expect("mint");
         let headers = vec![("Cookie".to_owned(), format!("ephpm_session_oauth={state_token}"))];
-        let resp =
-            invoke(&mw, "/_ephpm/auth/github/callback", "code=abc&state=nonce-value", &headers);
-        assert_eq!(
-            resp.__status(),
-            400,
-            "a state minted for another tenant must not complete here"
-        );
+        // `github_base` is 127.0.0.1:1 (closed), so getting past the local
+        // checks surfaces as a 502 from the code exchange, not a 400.
+        for host in ["nobody.example", "someone-else.example"] {
+            let resp = invoke_on(
+                &mw,
+                "",
+                host,
+                "/_ephpm/auth/github/callback",
+                "code=abcdefghij&state=nonce-value",
+                &headers,
+            );
+            assert_ne!(
+                resp.__status(),
+                400,
+                "unmatched host {host:?} shares the one untenanted binding"
+            );
+        }
     }
 
     #[test]
@@ -1124,19 +1392,17 @@ mod tests {
         }
     }
 
+    /// The module no longer normalises the host itself — the router hands over
+    /// one canonical key for every spelling — so what is pinned here is that
+    /// one tenant still derives **one** `redirect_uri` however the client wrote
+    /// the `Host`. That is the property the old local normalisation existed to
+    /// provide, now provided upstream (`request_host` is normalised too).
     #[test]
-    fn the_host_header_is_normalised_before_it_becomes_an_identity() {
-        // `request_vhost_id` hands over the RAW `Host` header. Two spellings
-        // of one host must not produce two identities, or a session minted
-        // under one would not match the other's `site` claim — and a `sites`
-        // lookup would be bypassable by changing a letter's case.
+    fn one_tenant_derives_one_redirect_uri_however_the_host_was_spelled() {
         let mw = gate(serde_json::json!({}));
         let mut seen = std::collections::BTreeSet::new();
-        for host in ["pr-1.preview.test", "PR-1.Preview.TEST", "pr-1.preview.test."] {
-            let ctx = RequestCtx::new("GET", "/", "", "203.0.113.9", host, &[]);
-            // SAFETY: `ctx` outlives the borrow; `host_table()` is 'static.
-            let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
-            let resp = mw.invoke(&req);
+        for host in ["pr-1.preview.test", "pr-1.preview.test", "pr-1.preview.test"] {
+            let resp = invoke_on(&mw, SITE, host, "/", "", &[]);
             assert_eq!(resp.__status(), 302);
             let loc = header(&resp, "Location").expect("Location");
             let redirect_uri = loc
@@ -1151,13 +1417,19 @@ mod tests {
         assert!(seen.iter().next().expect("one").contains("pr-1.preview.test"));
     }
 
+    /// The host that goes into the derived `redirect_uri` is still validated:
+    /// it is header-derived and it is heading for an outbound URL, so anything
+    /// that could not be a URL authority is refused before a login starts.
     #[test]
     fn a_hostile_host_header_is_rejected() {
         let mw = gate(serde_json::json!({}));
-        let ctx = RequestCtx::new("GET", "/", "", "203.0.113.9", "evil.test/../x", &[]);
-        // SAFETY: `ctx` outlives the borrow; `host_table()` is 'static.
-        let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
-        assert_eq!(mw.invoke(&req).__status(), 400);
+        for host in ["evil.test/../x", "", "has space", "a@b"] {
+            assert_eq!(
+                invoke_on(&mw, SITE, host, "/", "", &[]).__status(),
+                400,
+                "Host {host:?} must be refused"
+            );
+        }
     }
 
     #[test]
