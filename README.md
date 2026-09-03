@@ -161,11 +161,19 @@ a test pinning it (`the_gate_denies_a_static_asset_before_it_is_read` /
 ## Distribution
 
 There is **none** — this repo has no release workflow, no prebuilt `.so`, no
-checksums or manifest. It is source the **preview build compiles in** (the
-`switchboard` preview control plane and the `wordpress-sample` PR-preview app)
-via a git dependency / vendored source and a `[[middleware]]` mount. The
-official in-tree modules (`jwt`, `cors`, `ratelimit`, …) ship inside the ePHPm
-binary; this gate is preview-only infrastructure and lives here instead.
+checksums or manifest. It is intended as source a preview build compiles in, via
+a git dependency / vendored source and a `[[middleware]]` mount. The official
+in-tree modules (`jwt`, `cors`, `ratelimit`, …) ship inside the ePHPm binary;
+this gate is preview-only infrastructure and lives here instead.
+
+**No deployment mounts it yet.** An earlier revision of this section named
+`switchboard` and `wordpress-sample` as compiling it in; as of 2026-09-02
+neither does, and neither has ever had a `[[middleware]]` mount in its history.
+The generated `/etc/ephpm/ephpm.toml` in `switchboard-infra`'s StackScript sets
+only `[server]` and `[db.sqlite]`. `switchboard`'s own preview-app guide still
+tells users to "assume your preview URL is public". Treat this repo as
+not-yet-deployed infrastructure rather than as something with live consumers —
+which is also why the `sites` key-form change below has no config to migrate.
 
 The trade-off of the `dlopen`'d cdylib form: a fully static (musl) ePHPm cannot
 `dlopen`, so it cannot load these; the stock glibc-dynamic Linux release can. A
