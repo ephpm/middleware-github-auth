@@ -20,9 +20,14 @@ repository = "https://github.com/ephpm/middleware-github-auth"
 # both modules here are provably built against one specific host-ABI commit. To
 # rebuild against a newer host, replace `rev` and run `cargo update`.
 #
-# Pinned at ePHPm main `21a7c8a7832b62d0ab8af960931a33e8e9778784` — the merge
-# of ephpm#448, which took the ABI to **minor 3**. This bump is not a routine
-# refresh; it is the whole point of ephpm#449 for these two modules:
+# Pinned at ePHPm `c2774ab61b9d25b835282b2f70281fb45e11334d` — the commit
+# tagged **v0.8.9**, the first published release carrying ephpm#448 (merged to
+# main as `691e6fefa702e8f2a695af85377164866eedfbc5`), which took the ABI to
+# **minor 3**. The rev is the released tag's commit rather than the tag name so
+# the pin is immutable, and rather than the raw merge commit so both modules are
+# provably built against an ABI that actually shipped in a host binary operators
+# can run. This bump is not a routine refresh; it is the whole point of
+# ephpm#449 for these two modules:
 #
 #   * `Request::vhost_id()` returns `Option<&str>` carrying the router's
 #     CANONICAL SITE KEY, and `None` for a host that matched no virtual host.
@@ -38,12 +43,12 @@ repository = "https://github.com/ephpm/middleware-github-auth"
 # Still past #408 (the static-path request phase, ephpm#395) — ABI growth
 # within major 1 is additive, so everything the previous pin
 # (`b380cc6d0bbc61110475c0c3db3097e8bdf25018`) provided is still here.
-ephpm-middleware = { git = "https://github.com/ephpm/ephpm.git", rev = "21a7c8a7832b62d0ab8af960931a33e8e9778784" }
+ephpm-middleware = { git = "https://github.com/ephpm/ephpm.git", rev = "c2774ab61b9d25b835282b2f70281fb45e11334d" }
 # Test-only: the same embedded KV store the host wires into the middleware host
 # table, so the `host` feature's `RequestCtx` / `host_table` can fabricate a
 # request in unit and integration tests. Same rev as the ABI crate so both
 # resolve to one crate instance and the `Store` type matches.
-ephpm-kv = { git = "https://github.com/ephpm/ephpm.git", rev = "21a7c8a7832b62d0ab8af960931a33e8e9778784" }
+ephpm-kv = { git = "https://github.com/ephpm/ephpm.git", rev = "c2774ab61b9d25b835282b2f70281fb45e11334d" }
 
 # Both modules parse their config out of a `serde_json::Value`.
 serde_json = "1"
