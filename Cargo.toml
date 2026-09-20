@@ -1,16 +1,23 @@
 [package]
 name = "ephpm-middleware-github-auth"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
+version = "0.1.0"
+edition = "2024"
+# 1.88 matches the ePHPm workspace and the `ephpm-middleware` ABI crate this
+# module depends on by git rev; cargo refuses to compile a dependency whose
+# declared rust-version exceeds the active toolchain.
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/ephpm/middleware-github-auth"
 publish = false
 description = "ePHPm native middleware: GitHub OAuth login gate (cold path) that issues a stateless signed session for private preview sites"
 
 [lib]
 # Artifact name: libgithub_auth.so / libgithub_auth.dylib / github_auth.dll.
-# That file is what `[[middleware]] library = "..."` points at.
+# The host loader (`resolve_library` in ePHPm's ephpm-server/src/middleware.rs)
+# resolves `library = "github-auth"` by trying, in order, `github-auth.<os>-<arch>.so`,
+# `libgithub-auth.so`, `github-auth.so`. The cargo artifact is `libgithub_auth.so`
+# (underscore), so the release workflow renames it to the platform-suffixed
+# `github-auth.<os>-<arch>.so` form — the first name the loader tries.
 name = "github_auth"
 # cdylib is the loadable module. The rlib exists only so the unit and
 # integration tests can link the same code; a shipped module needs cdylib
@@ -18,19 +25,44 @@ name = "github_auth"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-ephpm-middleware.workspace = true
-serde_json.workspace = true
-# Session/state token signing. Same primitives (and the same constant-time
-# `Mac::verify_slice`) as the builtin `jwt` module, so a token minted here and
-# a token verified there agree by construction.
-base64ct.workspace = true
-hmac.workspace = true
-sha2.workspace = true
-# OS entropy for the OAuth `state` nonce. A syscall shim, not a generator.
-getrandom.workspace = true
+# ── The ePHPm native-middleware ABI + authoring kit ────────────────────────
+#
+# It lives in the ePHPm repo (`crates/ephpm-middleware`) and is the shared
+# contract between the host and this module. It is pinned by `rev` exactly the
+# way ePHPm pins litewire: a drift in `EphpmHostV1` / `ABI_V1` would be silent
+# UB at the FFI boundary, so this module is provably built against one specific
+# host-ABI commit. It is NOT vendored — the ABI is the host-owned contract, and
+# a fork is a fork of the contract. To rebuild against a newer host, replace
+# `rev` and run `cargo update`.
+#
+# Pinned at ePHPm `292e74f5ceb9bfe6df692f78a9624f10c8b44072` — the commit
+# tagged **v0.11.1**, a published release. The rev is the released tag's commit
+# (immutable, and an ABI that actually shipped in a host binary operators can
+# run) rather than the tag name or a floating branch.
+#
+# That commit carries ABI **major 1 / minor 4** (`ABI_V1 = 0x0100_0004`). Minor
+# 4 (ephpm#499) added `EphpmHostV1::request_gate_repo` / `Request::gate_repo()`
+# — the trusted per-preview repository channel this issuer reads in
+# per-preview access mode. The compatibility gate is the MAJOR byte: `declare!`
+# refuses to init unless `(host.abi_version >> 24) == 1`. Minor is additive, so
+# a host newer than minor 4 still loads this module; a host OLDER than minor 4
+# does not expose `gate_repo` and per-preview mode falls back closed.
+ephpm-middleware = { git = "https://github.com/ephpm/ephpm.git", rev = "292e74f5ceb9bfe6df692f78a9624f10c8b44072" }
 
-# NOTE: `tracing` is deliberately NOT a dependency. A dlopen'd module links
-# its own copy of the `tracing` crate with its own global dispatcher, which is
+# Config is parsed out of a `serde_json::Value`.
+serde_json = "1"
+# Session/state token signing. Same primitives (and the same constant-time
+# `Mac::verify_slice`) as ePHPm's `jwt` builtin and the `preview-gate` session
+# verifier, so a token minted here and a token verified there agree by
+# construction.
+base64ct = { version = "1", features = ["alloc"] }
+hmac = "0.12"
+sha2 = "0.10"
+# OS entropy for the OAuth `state` nonce. A syscall shim, not a generator.
+getrandom = "0.3"
+
+# NOTE: `tracing` is deliberately NOT a dependency. A dlopen'd module links its
+# own copy of the `tracing` crate with its own global dispatcher, which is
 # never the host's — a `tracing::info!` here would be silently swallowed. The
 # ABI's `log` callback (`ephpm_middleware::Host::log`) is the only thing that
 # reaches ePHPm's log stream, and it is what this module uses.
@@ -39,50 +71,81 @@ getrandom.workspace = true
 #
 # This is the reason the module ships as a dlopen'd cdylib rather than a
 # builtin: an HTTP client and a TLS stack are real weight, and none of it
-# belongs in the ephpm binary. Nothing below is a dependency of `ephpm`.
+# belongs in the ephpm binary.
 #
-# `rustls-tls-manual-roots-no-provider` is the ONLY correct reqwest TLS
-# feature here. Every other `rustls-tls-*` feature also enables reqwest's
-# `__rustls-ring` and links `ring`, which is the multi-provider bug tracked in
-# ephpm#241. "manual roots" + "no provider" means reqwest supplies neither a
-# crypto provider nor a root store; `github.rs` hands it a fully-built
-# `rustls::ClientConfig` instead. Inherited from the workspace, which pins
-# exactly that feature set for the OTLP exporter.
-reqwest.workspace = true
-# rustls is declared here rather than inherited with `workspace = true`, for
-# one reason: the workspace pin still carries `features = ["ring"]`, and
-# inheriting it would put a SECOND crypto provider in the shipped `.so`.
-#
-# `aws-lc-rs` is the right single provider: it is what ephpm#241/PR#368
-# converges the server on, it is already enabled on rustls 0.23 elsewhere in
-# this workspace (rustls-acme, rcgen, pgwire, hyper-rustls), and it is what
-# `github.rs` names explicitly in `builder_with_provider`. Naming `ring`
-# instead would break the moment #368 drops it from the pin.
-#
-# Verified with `cargo tree -e features,no-dev -p ephpm-middleware-github-auth
-# -i ring` (no match) and `... -p ephpm -i ring` (byte-identical to main).
-# The version tracks the workspace pin below it; Cargo resolves both to the
-# same 0.23.x lock entry, so there is no second rustls. When #368 lands and
-# the workspace pin loses `ring`, this can become `workspace = true`.
+# `rustls-tls-manual-roots-no-provider` is the ONLY correct reqwest TLS feature
+# here. Every other `rustls-tls-*` feature also enables reqwest's
+# `__rustls-ring` and links `ring` as a second crypto provider (the
+# multi-provider bug tracked in ephpm#241). "manual roots" + "no provider"
+# means reqwest supplies neither a crypto provider nor a root store;
+# `github.rs` hands it a fully-built `rustls::ClientConfig` instead. This is the
+# same feature set the ePHPm workspace pins.
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "rustls-tls-manual-roots-no-provider",
+] }
+# One crypto provider, `aws-lc-rs`, named explicitly in `github.rs`
+# (`builder_with_provider`) — matching ePHPm's convergence on a single provider
+# (ephpm#241). Naming `ring` instead would put a second provider in the shipped
+# `.so`. Verify with `cargo tree -e features,no-dev -i ring` (no match expected).
 rustls = { version = "0.23", default-features = false, features = [
     "std",
     "tls12",
     "logging",
     "aws-lc-rs",
 ] }
-rustls-native-certs.workspace = true
-webpki-roots.workspace = true
+rustls-native-certs = "0.8"
+webpki-roots = "0.26"
 
 [dev-dependencies]
 # `host` supplies the request context and callback table so tests can build a
-# real `Request` without a running server. A shipped module never enables it.
-ephpm-middleware = { workspace = true, features = ["host"] }
-# The hot-path verifier's crypto core, used ONLY in the apex-flow integration
-# test to prove end to end that a session this module mints is bound to the
-# target preview (verifies there, rejected on any other) — the #396 property
-# that makes the shared domain-scoped cookie safe. Test-only; never linked into
-# the shipped cdylib.
-ephpm-middleware-builtins = { path = "../ephpm-middleware-builtins" }
+# real `Request` (and, via the feature's transitive `ephpm-kv`, a store) without
+# a running server. A shipped module never enables it. Same git rev as the
+# dependency above, so both resolve to ONE `ephpm-middleware` crate instance and
+# the ABI types match by construction.
+ephpm-middleware = { git = "https://github.com/ephpm/ephpm.git", rev = "292e74f5ceb9bfe6df692f78a9624f10c8b44072", features = ["host"] }
+# Test-only: ePHPm's `preview-gate`/`jwt` HS256 verifier core, used ONLY in the
+# apex-flow integration test to prove end to end that a session this module
+# mints is accepted by the REAL hot-path verifier and is bound to the target
+# preview (verifies there, rejected on any other) — the #396 property that makes
+# the shared domain-scoped cookie safe. Same git rev, so its own transitive
+# `ephpm-middleware` unifies with ours. Never linked into the shipped cdylib.
+ephpm-middleware-builtins = { git = "https://github.com/ephpm/ephpm.git", rev = "292e74f5ceb9bfe6df692f78a9624f10c8b44072" }
 
-[lints]
-workspace = true
+# Release-profile tuning. `panic = "abort"` is DELIBERATELY NOT set: the
+# `declare!` glue in `ephpm-middleware` uses `catch_unwind` to fail CLOSED on a
+# panicking `invoke` (return 500) and fail STARTUP on a panicking `init`. Under
+# `panic = "abort"` those become no-ops and any module panic kills the whole
+# host process. Keep unwinding.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Mirror the ePHPm workspace's allow-list so a module that passes clippy here
+# passes it there too.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+doc_markdown = "allow"
+items_after_statements = "allow"
+manual_clamp = "allow"
+manual_let_else = "allow"
+needless_pass_by_value = "allow"
+ref_option = "allow"
+single_match_else = "allow"
+struct_excessive_bools = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+unchecked_time_subtraction = "allow"
+ignore_without_reason = "allow"
+uninlined_format_args = "allow"
+unnecessary_cast = "allow"
+unused_async = "allow"
+unused_self = "allow"
+used_underscore_binding = "allow"

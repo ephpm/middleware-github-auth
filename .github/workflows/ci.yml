@@ -1,0 +1,61 @@
+name: CI
+
+# GitHub-HOSTED runners only. This module is pure Rust and must NOT contend
+# with ePHPm's self-hosted (ephemerd) fleet, which is reserved for PHP-linked
+# and Windows/macOS legs of core.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fetch the ephpm-middleware git-rev dependency with the system git rather
+  # than libgit2 — robust against auth/proxy quirks. The pinned repo
+  # (ephpm/ephpm) is public, so no credentials are needed.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  build-and-test:
+    name: linux-x86_64-gnu build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + nightly rustfmt)
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install nightly --profile minimal --component rustfmt
+          rustup default stable
+          rustc --version && cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.toml') }}
+
+      - name: Format check (nightly — import grouping)
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Clippy (pedantic, warnings = errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build the cdylib (proves the ABI links against the pinned host)
+        run: cargo build --release --lib
+
+      - name: Assert the cdylib artifact exists
+        run: |
+          set -euo pipefail
+          test -f target/release/libgithub_auth.so
+          file target/release/libgithub_auth.so
+          # It must export the module entry points the host dlopen's.
+          nm -D --defined-only target/release/libgithub_auth.so | grep -E 'ephpm_middleware_(init|invoke|describe|shutdown)' \
+            || { echo "missing ephpm_middleware_* exports"; exit 1; }
+
+      - name: Test
+        run: cargo test --all-targets

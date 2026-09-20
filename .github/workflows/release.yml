@@ -1,0 +1,79 @@
+name: Release
+
+# GitHub-HOSTED runners only — pure Rust, must not touch the self-hosted fleet.
+#
+# On a `v*` tag: build the release cdylib for linux-x86_64-gnu (the platform the
+# ePHPm preview nodes run — glibc, matching the preview `ephpm` binary), rename
+# it to the exact file name the host loader tries first for
+# `library = "github-auth"`, publish it plus a SHA256SUMS integrity file as
+# release assets.
+#
+# Can also be run manually (workflow_dispatch) to cut a proof/prerelease.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # The name the host loader (resolve_library / platform_tag) tries FIRST for a
+  # bare `library = "github-auth"`: <name>.<os>-<arch>.<ext>.
+  ASSET_NAME: github-auth.linux-x86_64.so
+
+jobs:
+  release-linux-x86_64-gnu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Build release cdylib
+        run: cargo build --release --lib
+
+      - name: Stage the release asset (rename to the host-loader name)
+        run: |
+          set -euo pipefail
+          test -f target/release/libgithub_auth.so
+          mkdir -p dist
+          cp target/release/libgithub_auth.so "dist/${ASSET_NAME}"
+          cd dist
+          sha256sum "${ASSET_NAME}" > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+          # Sanity: the module exports the entry points the host dlopen's.
+          nm -D --defined-only "${ASSET_NAME}" | grep -E 'ephpm_middleware_(init|invoke|describe|shutdown)' \
+            || { echo "missing ephpm_middleware_* exports"; exit 1; }
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            PRERELEASE_FLAG=""
+          else
+            TAG="manual-$(date +%Y%m%d%H%M%S)"
+            git tag "$TAG"
+            git push origin "$TAG"
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "$TAG" \
+            dist/${ASSET_NAME} dist/SHA256SUMS \
+            --title "$TAG" \
+            --notes "ePHPm GitHub-OAuth preview gate (cold path). Asset: \`${ASSET_NAME}\` for linux-x86_64-gnu, built against the ABI pinned in Cargo.toml. Verify with \`sha256sum -c SHA256SUMS\`." \
+            $PRERELEASE_FLAG
